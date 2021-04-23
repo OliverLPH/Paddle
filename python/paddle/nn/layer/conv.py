@@ -15,16 +15,19 @@
 # TODO: define classes of convolutional neural network
 
 __all__ = [
-    'Conv1d',
-    'Conv2d',
-    'Conv3d',
-    'ConvTranspose1d',
-    'ConvTranspose2d',
-    'ConvTranspose3d',
+    'Conv1D',
+    'Conv2D',
+    'Conv3D',
+    'Conv1DTranspose',
+    'Conv2DTranspose',
+    'Conv3DTranspose',
 ]
 
 import numpy as np
 
+from ...fluid import get_flags
+from ...fluid import core
+from ...device import get_cudnn_version
 from ...fluid.dygraph import layers
 from ...fluid.initializer import Normal
 from .. import functional as F
@@ -83,6 +86,19 @@ class _ConvNd(layers.Layer):
                 "when padding_mode in ['reflect', 'replicate', 'circular'], type of padding must be int"
             )
 
+        valid_format = {'NHWC', 'NCHW', 'NDHWC', 'NCDHW', 'NLC', 'NCL'}
+        if data_format not in valid_format:
+            raise ValueError(
+                "data_format must be one of {}, but got data_format='{}'".
+                format(valid_format, data_format))
+
+        channel_last = (data_format == "NHWC") or (data_format == "NDHWC") or (
+            data_format == "NLC")
+        if channel_last:
+            self._channel_dim = len(data_format) - 1
+        else:
+            self._channel_dim = 1
+
         self._stride = utils.convert_to_list(stride, dims, 'stride')
         self._dilation = utils.convert_to_list(dilation, dims, 'dilation')
         self._kernel_size = utils.convert_to_list(kernel_size, dims,
@@ -90,6 +106,9 @@ class _ConvNd(layers.Layer):
         self._padding = padding
         self._padding_mode = padding_mode
         self.output_padding = output_padding
+        if dims != 1:
+            self._updated_padding, self._padding_algorithm = _update_padding_nd(
+                padding, channel_last, dims)
 
         if transposed:
             filter_shape = [self._in_channels, out_channels // groups
@@ -104,18 +123,66 @@ class _ConvNd(layers.Layer):
                 self._reversed_padding_repeated_twice = _reverse_repeat_list(
                     _paired_padding, 2)
 
+                self._updated_padding, self._padding_algorithm = _update_padding_nd(
+                    0, channel_last, dims)
+
             filter_shape = [out_channels, in_channels // groups
                             ] + self._kernel_size
 
+        def _get_default_param_initializer():
+            if transposed:
+                return None
+            filter_elem_num = np.prod(self._kernel_size) * self._in_channels
+            std = (2.0 / filter_elem_num)**0.5
+            return Normal(0.0, std, 0)
+
         self.weight = self.create_parameter(
-            shape=filter_shape, attr=self._param_attr)
+            shape=filter_shape,
+            attr=self._param_attr,
+            default_initializer=_get_default_param_initializer())
         self.bias = self.create_parameter(
             attr=self._bias_attr, shape=[self._out_channels], is_bias=True)
 
+        cudnn_version = get_cudnn_version()
 
-class Conv1d(_ConvNd):
-    """
-    This interface is used to construct a callable object of the ``Conv1d`` class.
+        self._use_cudnn = True if (core.is_compiled_with_cuda() and
+                                   cudnn_version is not None) else False
+
+        self._op_type = "conv" + str(dims) + 'd'
+        if self._op_type == 'conv2d' and (in_channels == groups and
+                                          in_channels != 1 and
+                                          out_channels % in_channels == 0):
+            self._op_type = 'depthwise_conv2d'
+            if core.is_compiled_with_rocm():
+                self._use_cudnn = True
+            else:
+                self._use_cudnn = False
+
+        if (core.is_compiled_with_cuda() and get_flags(
+                "FLAGS_conv2d_disable_cudnn")["FLAGS_conv2d_disable_cudnn"]):
+            self._use_cudnn = False
+
+    def extra_repr(self):
+        main_str = '{_in_channels}, {_out_channels}, kernel_size={_kernel_size}'
+        if self._stride != [1] * len(self._stride):
+            main_str += ', stride={_stride}'
+        if self._padding != 0:
+            main_str += ', padding={_padding}'
+        if self._padding_mode is not 'zeros':
+            main_str += ', padding_mode={_padding_mode}'
+        if self.output_padding != 0:
+            main_str += ', output_padding={_output_padding}'
+        if self._dilation != [1] * len(self._dilation):
+            main_str += ', dilation={_dilation}'
+        if self._groups != 1:
+            main_str += ', groups={_groups}'
+        main_str += ', data_format={_data_format}'
+        return main_str.format(**self.__dict__)
+
+
+class Conv1D(_ConvNd):
+    r"""
+    This interface is used to construct a callable object of the ``Conv1D`` class.
     For more details, refer to code examples.
     The convolution1D layer calculates the output based on the input, filter
     and stride, padding, dilation, groups parameters. Input and
@@ -127,25 +194,40 @@ class Conv1d(_ConvNd):
     If bias attribution and activation type are provided, bias is added to the
     output of the convolution, and the corresponding activation function is
     applied to the final result.
-    For each input :math:`X`, the equation is:
+
+    For each input :math:`X` , the equation is:
+
     .. math::
-        Out = \\sigma (W \\ast X + b)
+
+        Out = \sigma (W \ast X + b)
+
     Where:
+
     * :math:`X`: Input value, a ``Tensor`` with 'NCL' format or 'NLC' format.
     * :math:`W`: Filter value, a ``Tensor`` with shape [MCK] .
     * :math:`\\ast`: Convolution operation.
     * :math:`b`: Bias value, a 2-D ``Tensor`` with shape [M, 1].
     * :math:`\\sigma`: Activation function.
     * :math:`Out`: Output value, the shape of :math:`Out` and :math:`X` may be different.
+
     Example:
+
         - Input:
+
           Input shape: :math:`(N, C_{in}, L_{in})`
+
           Kernel shape: :math:`(C_{out}, C_{in}, K)`
+
         - Output:
+
           Output shape: :math:`(N, C_{out}, L_{out})`
+
         Where
+
         .. math::
-            L_{out}&= \\frac{(L_{in} + 2 * padding - (dilation * (L_f - 1) + 1))}{stride} + 1
+
+            L_{out}&= \frac{(L_{in} + 2 * padding - (dilation * (L_f - 1) + 1))}{stride} + 1 \\
+
     Parameters:
         in_channels(int): The number of channels in the input image.
         out_channels(int): The number of filter. It is as same as the output
@@ -176,25 +258,29 @@ class Conv1d(_ConvNd):
             of conv1d. If it is set to None or one attribute of ParamAttr, conv1d
             will create ParamAttr as param_attr. If the Initializer of the param_attr
             is not set, the parameter is initialized with :math:`Normal(0.0, std)`,
-            and the :math:`std` is :math:`(\\frac{2.0 }{filter\_elem\_num})^{0.5}`. Default: None.
+            and the :math:`std` is :math:`(\frac{2.0 }{filter\_elem\_num})^{0.5}`. Default: None.
         bias_attr (ParamAttr or bool, optional): The attribute for the bias of conv1d.
             If it is set to False, no bias will be added to the output units.
             If it is set to None or one attribute of ParamAttr, conv1d
             will create ParamAttr as bias_attr. If the Initializer of the bias_attr
             is not set, the bias is initialized zero. Default: None.
+
     Attribute:
         **weight** (Parameter): the learnable weights of filter of this layer.
         **bias** (Parameter or None): the learnable bias of this layer.
+
     Shape:
         - x: 3-D tensor with shape: (batch, in_channels, length) or (batch, length, in_channels).
         - output: 3-D tensor with same shape as input x.
     
     Raises:
         None
+
     Examples:
         .. code-block:: python
+
           import paddle
-          from paddle.nn import Conv1d
+          from paddle.nn import Conv1D
           import numpy as np
           x = np.array([[[4, 8, 1, 9],
             [7, 2, 0, 9],
@@ -206,13 +292,11 @@ class Conv1d(_ConvNd):
            [[0, 3, 4],
             [2, 9, 7],
             [5, 6, 8]]]).astype(np.float32)
-          paddle.disable_static()
           x_t = paddle.to_tensor(x)
-          conv = Conv1d(3, 2, 3)
+          conv = Conv1D(3, 2, 3)
           conv.weight.set_value(w)
           y_t = conv(x_t)
-          y_np = y_t.numpy()
-          print(y_np)
+          print(y_t)
           # [[[133. 238.]
           #   [160. 211.]]]
     """
@@ -229,7 +313,7 @@ class Conv1d(_ConvNd):
                  weight_attr=None,
                  bias_attr=None,
                  data_format="NCL"):
-        super(Conv1d, self).__init__(
+        super(Conv1D, self).__init__(
             in_channels,
             out_channels,
             kernel_size,
@@ -266,9 +350,9 @@ class Conv1d(_ConvNd):
         return out
 
 
-class ConvTranspose1d(_ConvNd):
-    """
-    This interface is used to construct a callable object of the ``ConvTranspose1d`` class.
+class Conv1DTranspose(_ConvNd):
+    r"""
+    This interface is used to construct a callable object of the ``Conv1DTranspose`` class.
     For more details, refer to code examples.
     The 1-D convolution transpose layer calculates the output based on the input,
     filter, and dilation, stride, padding. Input(Input) and output(Output)
@@ -284,7 +368,7 @@ class ConvTranspose1d(_ConvNd):
 
     .. math::
 
-        Out = \sigma (W \\ast X + b)
+        Out = \sigma (W \ast X + b)
 
     Where:
 
@@ -320,7 +404,7 @@ class ConvTranspose1d(_ConvNd):
           so for conv1d_transpose, when stride > 1, input shape maps multiple output shape.
           If output_size is None, :math:`L_{out} = L^\prime_{out}`;
           else, the :math:`L_{out}` of the output size must between :math:`L^\prime_{out}`
-          and :math:`L^\prime_{out} + stride`. conv1d_transpose can compute the kernel size automatically.
+          and :math:`L^\prime_{out} + stride`.
 
     Args:
         in_channels(int): The number of channels in the input image.
@@ -340,7 +424,7 @@ class ConvTranspose1d(_ConvNd):
              `[pad]` or `[pad_left, pad_right]`. Default: padding = 0.
         output_padding(int|list|tuple, optional): The count of zeros to be added to tail of each dimension.
              If it is a tuple, it must contain one integer. Default: 0.
-        groups(int, optional): The groups number of the Conv2d transpose layer. Inspired by
+        groups(int, optional): The groups number of the Conv2D transpose layer. Inspired by
             grouped convolution in Alex Krizhevsky's Deep CNN paper, in which
             when group=2, the first half of the filters is only connected to the
             first half of the input channels, while the second half of the
@@ -365,24 +449,18 @@ class ConvTranspose1d(_ConvNd):
         **bias** (Parameter or None): the learnable bias of this layer.
 
     Shape:
-        - x(Tensor): 3-D tensor with shape (batch, in_channels, length) when data_format is
-            "NCL" or shape (batch, length, in_channels) when data_format is "NLC".
-        - output_size(int|tuple|list, optional): The output image size. If output size is a
-            tuple, it must contain one integer, (feature_length). None if use
-            kernel_size, padding, output_padding and stride to calculate output_size.
-            If output_size and kernel_size are specified at the same time, They
-            should follow the formula above. Default: None. output_size and kernel_size
-            should not be None at the same time.
+
+        - x(Tensor): 3-D tensor with shape (batch, in_channels, length) when data_format is "NCL" or shape (batch, length, in_channels) when data_format is "NLC".
+        - output_size(int|tuple|list, optional): The output image size. If output size is a tuple, it must contain one integer, (feature_length). None if use kernel_size, padding, output_padding and stride to calculate output_size. If output_size and kernel_size are specified at the same time, They should follow the formula above. Default: None. output_size and kernel_size should not be None at the same time.
         - output(Tensor): 3-D tensor with same shape as input x.
 
     Examples:
        .. code-block:: python
 
           import paddle
-          from paddle.nn import ConvTranspose1d
+          from paddle.nn import Conv1DTranspose
           import numpy as np
           
-          paddle.disable_static()
           # shape: (1, 2, 4)
           x=np.array([[[4, 0, 9, 7],
                        [8, 0, 9, 2]]]).astype(np.float32)
@@ -390,11 +468,10 @@ class ConvTranspose1d(_ConvNd):
           y=np.array([[[7, 0]],
                       [[4, 2]]]).astype(np.float32)
           x_t = paddle.to_tensor(x)
-          conv = ConvTranspose1d(2, 1, 2)
+          conv = Conv1DTranspose(2, 1, 2)
           conv.weight.set_value(y)
           y_t = conv(x_t)
-          y_np = y_t.numpy()
-          print y_np
+          print(y_t)
           
           # [[[60. 16. 99. 75.  4.]]]
     """
@@ -411,7 +488,7 @@ class ConvTranspose1d(_ConvNd):
                  weight_attr=None,
                  bias_attr=None,
                  data_format="NCL"):
-        super(ConvTranspose1d, self).__init__(
+        super(Conv1DTranspose, self).__init__(
             in_channels,
             out_channels,
             kernel_size,
@@ -427,7 +504,7 @@ class ConvTranspose1d(_ConvNd):
             data_format=data_format)
 
     def forward(self, x, output_size=None):
-        out = F.conv_transpose1d(
+        out = F.conv1d_transpose(
             x,
             self.weight,
             bias=self.bias,
@@ -441,9 +518,9 @@ class ConvTranspose1d(_ConvNd):
         return out
 
 
-class Conv2d(_ConvNd):
-    """
-    This interface is used to construct a callable object of the ``Conv2d`` class.
+class Conv2D(_ConvNd):
+    r"""
+    This interface is used to construct a callable object of the ``Conv2D`` class.
     For more details, refer to code examples.
     The convolution2D layer calculates the output based on the input, filter
     and strides, paddings, dilations, groups parameters. Input and
@@ -463,7 +540,7 @@ class Conv2d(_ConvNd):
 
     ..  math::
 
-        Out = \sigma (W \\ast X + b)
+        Out = \sigma (W \ast X + b)
 
     Where:
 
@@ -491,7 +568,7 @@ class Conv2d(_ConvNd):
         dilation(int|list|tuple, optional): The dilation size. If dilation is a tuple, it must
             contain three integers, (dilation_D, dilation_H, dilation_W). Otherwise, the
             dilation_D = dilation_H = dilation_W = dilation. The default value is 1.
-        groups(int, optional): The groups number of the Conv3d Layer. According to grouped
+        groups(int, optional): The groups number of the Conv3D Layer. According to grouped
             convolution in Alex Krizhevsky's Deep CNN paper: when group=2,
             the first half of the filters is only connected to the first half
             of the input channels, while the second half of the filters is only
@@ -501,7 +578,7 @@ class Conv2d(_ConvNd):
             of conv2d. If it is set to None or one attribute of ParamAttr, conv2d
             will create ParamAttr as param_attr. If it is set to None, the parameter
             is initialized with :math:`Normal(0.0, std)`, and the :math:`std` is
-            :math:`(\\frac{2.0 }{filter\_elem\_num})^{0.5}`. The default value is None.
+            :math:`(\frac{2.0 }{filter\_elem\_num})^{0.5}`. The default value is None.
         bias_attr(ParamAttr|bool, optional): The parameter attribute for the bias of conv2d.
             If it is set to False, no bias will be added to the output units.
             If it is set to None or one attribute of ParamAttr, conv2d
@@ -526,9 +603,9 @@ class Conv2d(_ConvNd):
 
         ..  math::
 
-           H_{out}&= \\frac{(H_{in} + 2 * paddings[0] - (dilations[0] * (kernel\_size[0] - 1) + 1))}{strides[0]} + 1
+           H_{out}&= \frac{(H_{in} + 2 * paddings[0] - (dilations[0] * (kernel\_size[0] - 1) + 1))}{strides[0]} + 1
 
-           W_{out}&= \\frac{(W_{in} + 2 * paddings[1] - (dilations[1] * (kernel\_size[1] - 1) + 1))}{strides[1]} + 1
+           W_{out}&= \frac{(W_{in} + 2 * paddings[1] - (dilations[1] * (kernel\_size[1] - 1) + 1))}{strides[1]} + 1
 
     Examples:
 
@@ -536,10 +613,12 @@ class Conv2d(_ConvNd):
 
           import paddle
           import paddle.nn as nn
-
+          
+          paddle.disable_static()
+          
           x_var = paddle.uniform((2, 4, 8, 8), dtype='float32', min=-1., max=1.)
           
-          conv = nn.Conv2d(4, 6, (3, 3))
+          conv = nn.Conv2D(4, 6, (3, 3))
           y_var = conv(x_var)
           y_np = y_var.numpy()
           print(y_np.shape)
@@ -558,7 +637,7 @@ class Conv2d(_ConvNd):
                  weight_attr=None,
                  bias_attr=None,
                  data_format="NCHW"):
-        super(Conv2d, self).__init__(
+        super(Conv2D, self).__init__(
             in_channels,
             out_channels,
             kernel_size,
@@ -579,30 +658,26 @@ class Conv2d(_ConvNd):
                       self._reversed_padding_repeated_twice,
                       mode=self._padding_mode,
                       data_format=self._data_format)
-            return F.conv2d(
-                x,
-                self.weight,
-                bias=self.bias,
-                stride=self._stride,
-                dilation=self._dilation,
-                groups=self._groups,
-                data_format=self._data_format)
 
-        out = F.conv2d(
+        out = F.conv._conv_nd(
             x,
             self.weight,
             bias=self.bias,
-            padding=self._padding,
             stride=self._stride,
+            padding=self._updated_padding,
+            padding_algorithm=self._padding_algorithm,
             dilation=self._dilation,
             groups=self._groups,
-            data_format=self._data_format)
+            data_format=self._data_format,
+            channel_dim=self._channel_dim,
+            op_type=self._op_type,
+            use_cudnn=self._use_cudnn)
         return out
 
 
-class ConvTranspose2d(_ConvNd):
-    """
-    This interface is used to construct a callable object of the ``ConvTranspose2d`` class.
+class Conv2DTranspose(_ConvNd):
+    r"""
+    This interface is used to construct a callable object of the ``Conv2DTranspose`` class.
     For more details, refer to code examples.
     The convolution2D transpose layer calculates the output based on the input,
     filter, and dilations, strides, paddings. Input and output
@@ -621,7 +696,7 @@ class ConvTranspose2d(_ConvNd):
 
     ..  math::
 
-        Out = \sigma (W \\ast X + b)
+        Out = \sigma (W \ast X + b)
 
     Where:
 
@@ -635,7 +710,7 @@ class ConvTranspose2d(_ConvNd):
     Parameters:
         in_channels(int): The number of channels in the input image.
         out_channels(int): The number of channels produced by the convolution.
-        kernel_size(int|list|uple): The kernel size. If kernel_size is a tuple,
+        kernel_size(int|list|tuple): The kernel size. If kernel_size is a tuple,
             it must contain two integers, (kernel_size_H, kernel_size_W).
             Otherwise, the kernel will be a square.
         stride(int|list|tuple, optional): The stride size. If stride is a tuple, it must
@@ -653,7 +728,7 @@ class ConvTranspose2d(_ConvNd):
         dilation(int|list|tuple, optional): The dilation size. If dilation is a tuple, it must
             contain two integers, (dilation_H, dilation_W). Otherwise, the
             dilation_H = dilation_W = dilation. Default: 1.
-        groups(int, optional): The groups number of the Conv2d transpose layer. Inspired by
+        groups(int, optional): The groups number of the Conv2D transpose layer. Inspired by
             grouped convolution in Alex Krizhevsky's Deep CNN paper, in which
             when group=2, the first half of the filters is only connected to the
             first half of the input channels, while the second half of the
@@ -701,10 +776,12 @@ class ConvTranspose2d(_ConvNd):
 
           import paddle
           import paddle.nn as nn
+          
+          paddle.disable_static()
 
           x_var = paddle.uniform((2, 4, 8, 8), dtype='float32', min=-1., max=1.)
 
-          conv = nn.ConvTranspose2d(4, 6, (3, 3))
+          conv = nn.Conv2DTranspose(4, 6, (3, 3))
           y_var = conv(x_var)
           y_np = y_var.numpy()
           print(y_np.shape)
@@ -723,7 +800,7 @@ class ConvTranspose2d(_ConvNd):
                  weight_attr=None,
                  bias_attr=None,
                  data_format="NCHW"):
-        super(ConvTranspose2d, self).__init__(
+        super(Conv2DTranspose, self).__init__(
             in_channels,
             out_channels,
             kernel_size,
@@ -744,7 +821,7 @@ class ConvTranspose2d(_ConvNd):
         else:
             output_padding = 0
 
-        out = F.conv_transpose2d(
+        out = F.conv2d_transpose(
             x,
             self.weight,
             bias=self.bias,
@@ -758,8 +835,8 @@ class ConvTranspose2d(_ConvNd):
         return out
 
 
-class Conv3d(_ConvNd):
-    """
+class Conv3D(_ConvNd):
+    r"""
     **Convlution3d Layer**
     The convolution3d layer calculates the output based on the input, filter
     and strides, paddings, dilations, groups parameters. Input(Input) and
@@ -774,7 +851,7 @@ class Conv3d(_ConvNd):
 
     ..  math::
 
-        Out = \sigma (W \\ast X + b)
+        Out = \sigma (W \ast X + b)
 
     In the above equation:
 
@@ -802,7 +879,7 @@ class Conv3d(_ConvNd):
         dilation(int|list|tuple, optional): The dilation size. If dilation is a tuple, it must
             contain three integers, (dilation_D, dilation_H, dilation_W). Otherwise, the
             dilation_D = dilation_H = dilation_W = dilation. The default value is 1.
-        groups(int, optional): The groups number of the Conv3d Layer. According to grouped
+        groups(int, optional): The groups number of the Conv3D Layer. According to grouped
             convolution in Alex Krizhevsky's Deep CNN paper: when group=2,
             the first half of the filters is only connected to the first half
             of the input channels, while the second half of the filters is only
@@ -812,7 +889,7 @@ class Conv3d(_ConvNd):
             of conv3d. If it is set to None or one attribute of ParamAttr, conv3d
             will create ParamAttr as param_attr. If it is set to None, the parameter
             is initialized with :math:`Normal(0.0, std)`, and the :math:`std` is
-            :math:`(\\frac{2.0 }{filter\_elem\_num})^{0.5}`. The default value is None.
+            :math:`(\frac{2.0 }{filter\_elem\_num})^{0.5}`. The default value is None.
         bias_attr(ParamAttr|bool, optional): The parameter attribute for the bias of conv3d.
             If it is set to False, no bias will be added to the output units.
             If it is set to None or one attribute of ParamAttr, conv3d
@@ -837,11 +914,11 @@ class Conv3d(_ConvNd):
 
         ..  math::
 
-           D_{out}&= \\frac{(D_{in} + 2 * paddings[0] - (dilations[0] * (kernel\_size[0] - 1) + 1))}{strides[0]} + 1
+           D_{out}&= \frac{(D_{in} + 2 * paddings[0] - (dilations[0] * (kernel\_size[0] - 1) + 1))}{strides[0]} + 1
 
-           H_{out}&= \\frac{(H_{in} + 2 * paddings[1] - (dilations[1] * (kernel\_size[1] - 1) + 1))}{strides[1]} + 1
+           H_{out}&= \frac{(H_{in} + 2 * paddings[1] - (dilations[1] * (kernel\_size[1] - 1) + 1))}{strides[1]} + 1
 
-           W_{out}&= \\frac{(W_{in} + 2 * paddings[2] - (dilations[2] * (kernel\_size[2] - 1) + 1))}{strides[2]} + 1
+           W_{out}&= \frac{(W_{in} + 2 * paddings[2] - (dilations[2] * (kernel\_size[2] - 1) + 1))}{strides[2]} + 1
 
     Raises:
         ValueError: If the shapes of input, filter_size, stride, padding and
@@ -853,10 +930,12 @@ class Conv3d(_ConvNd):
 
           import paddle
           import paddle.nn as nn
+          
+          paddle.disable_static()
 
           x_var = paddle.uniform((2, 4, 8, 8, 8), dtype='float32', min=-1., max=1.)
           
-          conv = nn.Conv3d(4, 6, (3, 3, 3))
+          conv = nn.Conv3D(4, 6, (3, 3, 3))
           y_var = conv(x_var)
           y_np = y_var.numpy()
           print(y_np.shape)
@@ -875,7 +954,7 @@ class Conv3d(_ConvNd):
                  weight_attr=None,
                  bias_attr=None,
                  data_format="NCDHW"):
-        super(Conv3d, self).__init__(
+        super(Conv3D, self).__init__(
             in_channels,
             out_channels,
             kernel_size,
@@ -896,29 +975,25 @@ class Conv3d(_ConvNd):
                       self._reversed_padding_repeated_twice,
                       mode=self._padding_mode,
                       data_format=self._data_format)
-            return F.conv3d(
-                x,
-                self.weight,
-                bias=self.bias,
-                stride=self._stride,
-                dilation=self._dilation,
-                groups=self._groups,
-                data_format=self._data_format)
 
-        out = F.conv3d(
+        out = F.conv._conv_nd(
             x,
             self.weight,
             bias=self.bias,
-            padding=self._padding,
             stride=self._stride,
+            padding=self._updated_padding,
+            padding_algorithm=self._padding_algorithm,
             dilation=self._dilation,
             groups=self._groups,
-            data_format=self._data_format)
+            data_format=self._data_format,
+            channel_dim=self._channel_dim,
+            op_type=self._op_type,
+            use_cudnn=self._use_cudnn)
         return out
 
 
-class ConvTranspose3d(_ConvNd):
-    """
+class Conv3DTranspose(_ConvNd):
+    r"""
     **Convlution3D transpose layer**
     The convolution3D transpose layer calculates the output based on the input,
     filter, and dilations, strides, paddings. Input(Input) and output(Output)
@@ -935,7 +1010,7 @@ class ConvTranspose3d(_ConvNd):
     
     ..  math::
 
-        Out = \sigma (W \\ast X + b)
+        Out = \sigma (W \ast X + b)
 
     In the above equation:
 
@@ -948,16 +1023,16 @@ class ConvTranspose3d(_ConvNd):
 
     **Note**:
 
-          The conv_transpose3d can be seen as the backward of the conv3d. For conv3d, 
+          The conv3d_transpose can be seen as the backward of the conv3d. For conv3d,
           when stride > 1, conv3d maps multiple input shape to the same output shape, 
-          so for conv_transpose3d, when stride > 1, input shape maps multiple output shape.
+          so for conv3d_transpose, when stride > 1, input shape maps multiple output shape.
           If output_size is None, :math:`H_{out} = H^\prime_{out}, :math:`H_{out} = \
           H^\prime_{out}, W_{out} = W^\prime_{out}`; else, the :math:`D_{out}` of the output 
           size must between :math:`D^\prime_{out}` and :math:`D^\prime_{out} + strides[0]`, 
           the :math:`H_{out}` of the output size must between :math:`H^\prime_{out}` 
           and :math:`H^\prime_{out} + strides[1]`, and the :math:`W_{out}` of the output size must 
           between :math:`W^\prime_{out}` and :math:`W^\prime_{out} + strides[2]`, 
-          conv_transpose3d can compute the kernel size automatically.
+          conv3d_transpose can compute the kernel size automatically.
 
     Parameters:
         in_channels(int): The number of channels in the input image.
@@ -981,7 +1056,7 @@ class ConvTranspose3d(_ConvNd):
         dilation(int|list|tuple, optional): The dilation size. If dilation is a tuple, it must
             contain three integers, (dilation_D, dilation_H, dilation_W). Otherwise, the
             dilation_D = dilation_H = dilation_W = dilation. The default value is 1.
-        groups(int, optional): The groups number of the Conv3d transpose layer. Inspired by
+        groups(int, optional): The groups number of the Conv3D transpose layer. Inspired by
             grouped convolution in Alex Krizhevsky's Deep CNN paper, in which
             when group=2, the first half of the filters is only connected to the
             first half of the input channels, while the second half of the
@@ -1035,10 +1110,12 @@ class ConvTranspose3d(_ConvNd):
 
           import paddle
           import paddle.nn as nn
+          
+          paddle.disable_static()
 
           x_var = paddle.uniform((2, 4, 8, 8, 8), dtype='float32', min=-1., max=1.)
           
-          conv = nn.ConvTranspose3d(4, 6, (3, 3, 3))
+          conv = nn.Conv3DTranspose(4, 6, (3, 3, 3))
           y_var = conv(x_var)
           y_np = y_var.numpy()
           print(y_np.shape)
@@ -1057,7 +1134,7 @@ class ConvTranspose3d(_ConvNd):
                  weight_attr=None,
                  bias_attr=None,
                  data_format="NCDHW"):
-        super(ConvTranspose3d, self).__init__(
+        super(Conv3DTranspose, self).__init__(
             in_channels,
             out_channels,
             kernel_size,
@@ -1078,7 +1155,7 @@ class ConvTranspose3d(_ConvNd):
         else:
             output_padding = 0
 
-        out = F.conv_transpose3d(
+        out = F.conv3d_transpose(
             x,
             self.weight,
             bias=self.bias,

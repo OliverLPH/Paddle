@@ -105,30 +105,58 @@ class Collective(object):
             wait_server_ready(other_endpoints)
 
         block = program.global_block()
-        nccl_id_var = block.create_var(
-            name=unique_name.generate('nccl_id'),
-            persistable=True,
-            type=core.VarDesc.VarType.RAW)
-        block.append_op(
-            type='c_gen_nccl_id',
-            inputs={},
-            outputs={'Out': nccl_id_var},
-            attrs={
-                'rank': rank,
-                'endpoint': current_endpoint,
-                'other_endpoints': other_endpoints,
-                self.op_role_key: OpRole.Forward
-            })
-        block.append_op(
-            type='c_comm_init',
-            inputs={'X': nccl_id_var},
-            outputs={},
-            attrs={
-                'nranks': nranks,
-                'rank': rank,
-                'ring_id': ring_id,
-                self.op_role_key: OpRole.Forward
-            })
+        if core.is_compiled_with_npu():
+            hccl_id_var = block.create_var(
+                name=unique_name.generate('hccl_id'),
+                persistable=True,
+                type=core.VarDesc.VarType.RAW)
+            endpoint_to_index_map = {e: idx for idx, e in enumerate(endpoints)}
+            block.append_op(
+                type='c_gen_hccl_id',
+                inputs={},
+                outputs={'Out': hccl_id_var},
+                attrs={
+                    'rank': rank,
+                    'endpoint': current_endpoint,
+                    'other_endpoints': other_endpoints,
+                    self.op_role_key: OpRole.Forward
+                })
+            block.append_op(
+                type='c_comm_init_hccl',
+                inputs={'X': hccl_id_var},
+                outputs={},
+                attrs={
+                    'rank': rank,
+                    'ring_id': ring_id,
+                    'device_id': int(os.getenv("FLAGS_selected_npus")),
+                    'rank_ids': nranks,
+                    self.op_role_key: OpRole.Forward
+                })
+        else:
+            nccl_id_var = block.create_var(
+                name=unique_name.generate('nccl_id'),
+                persistable=True,
+                type=core.VarDesc.VarType.RAW)
+            block.append_op(
+                type='c_gen_nccl_id',
+                inputs={},
+                outputs={'Out': nccl_id_var},
+                attrs={
+                    'rank': rank,
+                    'endpoint': current_endpoint,
+                    'other_endpoints': other_endpoints,
+                    self.op_role_key: OpRole.Forward
+                })
+            block.append_op(
+                type='c_comm_init',
+                inputs={'X': nccl_id_var},
+                outputs={},
+                attrs={
+                    'nranks': nranks,
+                    'rank': rank,
+                    'ring_id': ring_id,
+                    self.op_role_key: OpRole.Forward
+                })
 
     def _broadcast_params(self):
         block = self.startup_program.global_block()
@@ -386,3 +414,27 @@ class SingleProcessMultiThread(GradAllReduce):
     def _transpile_startup_program(self):
         block = self.startup_program.global_block()
         block.append_op(type='c_comm_init_all', attrs={'ring_id': 0})
+
+
+class MultiThread(GradAllReduce):
+    '''
+    '''
+
+    def __init__(self, nrings=1):
+        GradAllReduce.__init__(self, nrings)
+        self.mode = "box"
+
+    def _transpile_startup_program(self):
+        if len(self.endpoints) > 1:
+            print("begin to _transpile_startup_program for multi-node")
+            print("current_endpoint: ", self.current_endpoint)
+            print("total endpoints: ", self.endpoints)
+            print("rank: %d, ring_id: %d" % (self.rank, self.nrings))
+            for ring_id in range(self.nrings):
+                self._init_communicator(
+                    self.startup_program, self.current_endpoint, self.endpoints,
+                    self.rank, ring_id, self.wait_port, True)
+        else:
+            print("begin to _transpile_startup_program for single-node")
+            block = self.startup_program.global_block()
+            block.append_op(type='c_comm_init_all', attrs={'ring_id': 0})

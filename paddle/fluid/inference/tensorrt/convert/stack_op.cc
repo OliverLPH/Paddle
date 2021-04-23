@@ -16,6 +16,15 @@ limitations under the License. */
 #include "paddle/fluid/inference/tensorrt/plugin/stack_op_plugin.h"
 
 namespace paddle {
+namespace framework {
+class Scope;
+namespace proto {
+class OpDesc;
+}  // namespace proto
+}  // namespace framework
+}  // namespace paddle
+
+namespace paddle {
 namespace inference {
 namespace tensorrt {
 
@@ -36,6 +45,11 @@ class StackOpConverter : public OpConverter {
 
     for (int i = 0; i < input_num; ++i) {
       inputs[i] = engine_->GetITensor(input[i]);
+      if (op_desc.HasAttr("out_threshold")) {
+        float out_scale =
+            BOOST_GET_CONST(float, op_desc.GetAttr("out_threshold"));
+        engine_->SetTensorDynamicRange(inputs[i], out_scale);
+      }
     }
 
     int axis = BOOST_GET_CONST(int, op_desc.GetAttr("axis"));
@@ -46,9 +60,11 @@ class StackOpConverter : public OpConverter {
     nvinfer1::ILayer* layer = nullptr;
     if (engine_->with_dynamic_shape()) {
 #if IS_TRT_VERSION_GE(6000)
+      bool with_fp16 =
+          engine_->WithFp16() && !engine_->disable_trt_plugin_fp16();
       plugin::StackPluginDynamic* plugin =
-          new plugin::StackPluginDynamic(axis, input_num);
-      layer = engine_->AddPluginV2(inputs, input_num, plugin);
+          new plugin::StackPluginDynamic(axis, input_num, with_fp16);
+      layer = engine_->AddDynamicPlugin(inputs, input_num, plugin);
       assert(layer != nullptr);
 #else
       PADDLE_THROW(platform::errors::Fatal(

@@ -14,14 +14,46 @@
 
 import inspect
 import numpy as np
+import warnings
+import weakref
 
 import paddle
 from .. import framework
 from .. import core
+from .. import unique_name
 from ..framework import Variable, Parameter, ParamBase
 from .base import switch_to_static_graph
 from .math_op_patch import monkey_patch_math_varbase
 from .parallel import scale_loss
+from paddle.fluid.data_feeder import convert_dtype, _PADDLE_DTYPE_2_NUMPY_DTYPE
+
+
+class TensorHookRemoveHelper(object):
+    """
+    A helper class that for removing Tensor gradient's hook.
+    """
+
+    def __init__(self, tensor, hook_id):
+        self._tensor_ref = weakref.ref(tensor)
+        self._hook_id = hook_id
+
+    def remove(self):
+        """
+        Remove reference Tensor's hook.
+
+        Returns:
+            bool: Return True if removed successfully
+        """
+        tensor = self._tensor_ref()
+        if tensor is not None:
+            res = tensor._remove_grad_hook(self._hook_id)
+            if res is True:
+                return True
+            else:
+                warnings.warn(
+                    "The backward hook (ID: %d) of Tensor `%s` you want to remove does not exist or has been removed."
+                    % (self._hook_id, tensor.name), RuntimeWarning)
+        return False
 
 
 def monkey_patch_varbase():
@@ -131,49 +163,76 @@ def monkey_patch_varbase():
                                       framework._current_expected_place())
 
     @framework.dygraph_only
-    def backward(self, retain_graph=False):
+    def backward(self, grad_tensor=None, retain_graph=False):
         """
-        **Notes**:
-            **This API is ONLY available in Dygraph mode**
-
         Run backward of current Graph which starts from current Tensor.
 
+        The new gradient will accumulat on previous gradient.
+
+        You can clear gradient by ``Tensor.clear_grad()`` .
+
         Args:
+            grad_tensor(Tensor, optional): initial gradient values of the current Tensor. If `grad_tensor` is None, 
+            the initial gradient values of the current Tensor would be Tensor filled with 1.0; 
+            if `grad_tensor` is not None, it must have the same length as the current Tensor.
+            Teh default value is None.
+
             retain_graph(bool, optional): If False, the graph used to compute grads will be freed. If you would
                 like to add more ops to the built graph after calling this method( :code:`backward` ), set the parameter
                 :code:`retain_graph` to True, then the grads will be retained. Thus, seting it to False is much more memory-efficient.
                 Defaults to False.
-
         Returns:
             NoneType: None
 
         Examples:
             .. code-block:: python
 
-                import numpy as np
                 import paddle
-                paddle.disable_static()
+                x = paddle.to_tensor(5., stop_gradient=False)
+                for i in range(5):
+                    y = paddle.pow(x, 4.0)
+                    y.backward()
+                    print("{}: {}".format(i, x.grad))
+                # 0: [500.]
+                # 1: [1000.]
+                # 2: [1500.]
+                # 3: [2000.]
+                # 4: [2500.]
 
-                x = np.ones([2, 2], np.float32)
-                inputs = []
-                for _ in range(10):
-                    tmp = paddle.to_tensor(x)
-                    # if we don't set tmp's stop_gradient as False then, all path to loss will has no gradient since
-                    # there is no one need gradient on it.
-                    tmp.stop_gradient=False
-                    inputs.append(tmp)
-                ret = paddle.add_n(inputs)
-                loss = paddle.sum(ret)
-                loss.backward()
+                x.clear_grad()
+                print("{}".format(x.grad))
+                # 0.
+
+                grad_tensor=paddle.to_tensor(2.)
+                for i in range(5):
+                    y = paddle.pow(x, 4.0)
+                    y.backward(grad_tensor)
+                    print("{}: {}".format(i, x.grad))
+                # 0: [1000.]
+                # 1: [2000.]
+                # 2: [3000.]
+                # 3: [4000.]
+                # 4: [5000.]
 
         """
         if framework.in_dygraph_mode():
-            if paddle.distributed.get_world_size() > 1:
+            if grad_tensor is not None:
+                assert isinstance(
+                    grad_tensor, paddle.
+                    Tensor), "The type of grad_tensot must be paddle.Tensor"
+                assert grad_tensor.shape == self.shape, \
+                    "Tensor shape not match, Tensor of grad_tensor [ {} ] with shape {} mismatch Tensor [ {} ] with shape {}".format(
+                    grad_tensor.name, grad_tensor.shape, self.name, self.shape)
+
+            if paddle.is_compiled_with_xpu():
+                # TODO(liuyuhui): Currently only for xpu. Will be removed in the future.
                 scaled_loss = scale_loss(self)
-                scaled_loss._run_backward(framework._dygraph_tracer(),
-                                          retain_graph)
+                core.dygraph_run_backward([scaled_loss], [grad_tensor],
+                                          retain_graph,
+                                          framework._dygraph_tracer())
             else:
-                self._run_backward(framework._dygraph_tracer(), retain_graph)
+                core.dygraph_run_backward([self], [grad_tensor], retain_graph,
+                                          framework._dygraph_tracer())
         else:
             raise ValueError(
                 "Variable.backward() is only available in DyGraph mode")
@@ -181,31 +240,21 @@ def monkey_patch_varbase():
     @framework.dygraph_only
     def gradient(self):
         """
-        **Notes**:
-            **This API is ONLY available in Dygraph mode**
-
-        Get the Gradient of Current Variable
+        Get the Gradient of Current Tensor.
 
         Returns:
-            ndarray: Numpy value of the gradient of current Variable
+            ndarray: Numpy value of the gradient of current Tensor
 
         Examples:
             .. code-block:: python
 
-                import paddle.fluid as fluid
-                import numpy as np
+                import paddle
 
-                x = np.ones([2, 2], np.float32)
-                with fluid.dygraph.guard():
-                    inputs2 = []
-                    for _ in range(10):
-                        tmp = fluid.dygraph.base.to_variable(x)
-                        tmp.stop_gradient=False
-                        inputs2.append(tmp)
-                    ret2 = fluid.layers.sums(inputs2)
-                    loss2 = fluid.layers.reduce_sum(ret2)
-                    loss2.backward()
-                    print(loss2.gradient())
+                x = paddle.to_tensor(5., stop_gradient=False)
+                y = paddle.pow(x, 4.0)
+                y.backward()
+                print("grad of x: {}".format(x.grad))
+                # [500.]
 
         """
         if self._grad_ivar() is None:
@@ -218,6 +267,73 @@ def monkey_patch_varbase():
         else:
             return np.array(new_ivar.value().get_tensor())
 
+    @framework.dygraph_only
+    def register_hook(self, hook):
+        """
+        Registers a backward hook for current Tensor.
+
+        The hook will be called every time the gradient Tensor of current Tensor is computed.
+
+        The hook should not modify the input gradient Tensor, but it can optionally return
+        a new gradient Tensor which will be used in place of current Tensor's gradient.
+
+        The hook should have the following signature:
+
+            hook(grad) -> Tensor or None
+
+        Args:
+            hook(function): A backward hook to be registered for Tensor.grad
+
+        Returns:
+            TensorHookRemoveHelper: A helper object that can be used to remove the registered hook by calling `remove()` method.
+
+        Examples:
+            .. code-block:: python
+
+                import paddle
+
+                # hook function return None
+                def print_hook_fn(grad):
+                    print(grad)
+
+                # hook function return Tensor
+                def double_hook_fn(grad):
+                    grad = grad * 2
+                    return grad
+
+                x = paddle.to_tensor([0., 1., 2., 3.], stop_gradient=False)
+                y = paddle.to_tensor([4., 5., 6., 7.], stop_gradient=False)
+                z = paddle.to_tensor([1., 2., 3., 4.])
+
+                # one Tensor can register multiple hooks
+                h = x.register_hook(print_hook_fn)
+                x.register_hook(double_hook_fn)
+
+                w = x + y
+                # register hook by lambda function
+                w.register_hook(lambda grad: grad * 2)
+
+                o = z.matmul(w)
+                o.backward()
+                # print_hook_fn print content in backward
+                # Tensor(shape=[4], dtype=float32, place=CUDAPlace(0), stop_gradient=False,
+                #        [2., 4., 6., 8.])
+
+                print("w.grad:", w.grad) # w.grad: [1. 2. 3. 4.]
+                print("x.grad:", x.grad) # x.grad: [ 4.  8. 12. 16.]
+                print("y.grad:", y.grad) # y.grad: [2. 4. 6. 8.]
+
+                # remove hook
+                h.remove()
+        """
+        if self.stop_gradient is True:
+            raise RuntimeError(
+                "Cannot register hook on a tensor that stop gradient.")
+
+        hook_id = self._register_grad_hook(hook)
+        helper = TensorHookRemoveHelper(self, hook_id)
+        return helper
+
     @property
     def grad(self):
         """
@@ -225,6 +341,33 @@ def monkey_patch_varbase():
         """
 
         return self.gradient()
+
+    def clear_grad(self):
+        """
+        The alias of clear_gradient().
+        """
+        self.clear_gradient()
+
+    @property
+    def inplace_version(self):
+        """
+        The inplace version of current Tensor.
+        The version number is incremented whenever the current Tensor is modified through an inplace operation.
+
+        **Notes: This is a read-only property**
+
+        Examples:
+          .. code-block:: python
+
+            import paddle
+            var = paddle.ones(shape=[4, 2, 3], dtype="float32")
+            print(var.inplace_version)  # 0
+
+            var[1] = 2.2
+            print(var.inplace_version)  # 1
+
+        """
+        return self._inplace_version()
 
     def __str__(self):
         """
@@ -246,6 +389,37 @@ def monkey_patch_varbase():
         from paddle.tensor.to_string import to_string
         return to_string(self)
 
+    def __deepcopy__(self, memo):
+        """
+        Deep copy Tensor, it will always performs Tensor copy.
+
+        Examples:
+            .. code-block:: python
+
+                import paddle
+                import copy
+                x = paddle.to_tensor(2.)
+                y = copy.deepcopy(x)
+                
+                print(x)
+                # Tensor(shape=[1], dtype=float32, place=CPUPlace, stop_gradient=True,
+                #        [2.])
+
+                print(y)
+                # Tensor(shape=[1], dtype=float32, place=CPUPlace, stop_gradient=True,
+                #        [2.])
+
+        """
+        if not self.is_leaf:
+            raise RuntimeError(
+                "Only Leaf Tensor support the deepcopy at the moment, non-Leaf Tensors contains graph information that does't support deepcopy"
+            )
+        new_varbase = core.VarBase()
+        new_varbase.name = self.name + unique_name.generate("_deepcopy")
+        memo[id(self)] = new_varbase
+        new_varbase.copy_(self, True)
+        return new_varbase
+
     @property
     def block(self):
         return framework.default_main_program().global_block()
@@ -260,13 +434,34 @@ def monkey_patch_varbase():
     def __bool__(self):
         return self.__nonzero__()
 
+    def __array__(self, dtype=None):
+        return self.numpy().astype(dtype)
+
     for method_name, method in (
         ("__bool__", __bool__), ("__nonzero__", __nonzero__),
         ("_to_static_var", _to_static_var), ("set_value", set_value),
-        ("block", block), ("backward", backward), ("grad", grad),
-        ("gradient", gradient), ("__str__", __str__), ("__repr__", __str__),
-        ("__module__", "paddle"), ("__name__", "Tensor")):
+        ("block", block), ("backward", backward), ("clear_grad", clear_grad),
+        ("inplace_version", inplace_version), ("grad", grad),
+        ("gradient", gradient), ("register_hook", register_hook),
+        ("__str__", __str__), ("__repr__", __str__),
+        ("__deepcopy__", __deepcopy__), ("__module__", "paddle"),
+        ("__name__", "Tensor"), ("__array__", __array__)):
         setattr(core.VarBase, method_name, method)
+
+    # NOTE(zhiqiu): pybind11 will set a default __str__ method of enum class.
+    # So, we need to overwrite it to a more readable one.
+    # See details in https://github.com/pybind/pybind11/issues/2537.
+    origin = getattr(core.VarDesc.VarType, "__repr__")
+
+    def dtype_str(dtype):
+        if dtype in _PADDLE_DTYPE_2_NUMPY_DTYPE:
+            prefix = 'paddle.'
+            return prefix + _PADDLE_DTYPE_2_NUMPY_DTYPE[dtype]
+        else:
+            # for example, paddle.fluid.core.VarDesc.VarType.LOD_TENSOR
+            return origin(dtype)
+
+    setattr(core.VarDesc.VarType, "__repr__", dtype_str)
 
     # patch math methods for varbase
     monkey_patch_math_varbase()

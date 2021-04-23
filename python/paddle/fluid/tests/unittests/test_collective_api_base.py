@@ -37,30 +37,6 @@ class TestCollectiveAPIRunnerBase(object):
         raise NotImplementedError(
             "get model should be implemented by child class.")
 
-    def wait_server_ready(self, endpoints):
-        assert not isinstance(endpoints, string_types)
-        while True:
-            all_ok = True
-            not_ready_endpoints = []
-            for ep in endpoints:
-                ip_port = ep.split(":")
-                with closing(
-                        socket.socket(socket.AF_INET,
-                                      socket.SOCK_STREAM)) as sock:
-                    sock.settimeout(2)
-                    result = sock.connect_ex((ip_port[0], int(ip_port[1])))
-                    if result != 0:
-                        all_ok = False
-                        not_ready_endpoints.append(ep)
-            if not all_ok:
-                sys.stderr.write("server not ready, wait 3 sec to retry...\n")
-                sys.stderr.write("not ready endpoints:" + str(
-                    not_ready_endpoints) + "\n")
-                sys.stderr.flush()
-                time.sleep(3)
-            else:
-                break
-
     def run_trainer(self, args):
         train_prog = fluid.Program()
         startup_prog = fluid.Program()
@@ -74,12 +50,15 @@ class TestCollectiveAPIRunnerBase(object):
             device_id = int(os.getenv("FLAGS_selected_gpus", "0"))
             place = fluid.CUDAPlace(
                 device_id)  #if args.use_gpu else fluid.CPUPlace()
+        elif args['backend'] == 'bkcl':
+            device_id = int(os.getenv("FLAGS_selected_xpus", "0"))
+            place = fluid.XPUPlace(device_id)
         else:
             place = fluid.CPUPlace()
         exe = fluid.Executor(place)
         exe.run(startup_prog)
         np.random.seed(os.getpid())
-        indata = np.random.random((10, 1000))
+        indata = np.random.random((10, 1000)).astype("float32")
         fetch_list = []
         for elem in result:
             fetch_list.append(elem.name)
@@ -95,7 +74,6 @@ class TestCollectiveAPIRunnerBase(object):
 def runtime_main(test_class, col_type):
     args = {}
     model = test_class()
-    args["deviceid"] = os.getenv("FLAGS_selected_gpus")
     args["trainerid"] = int(os.getenv("PADDLE_TRAINER_ID"))
     args["trainernum"] = int(os.getenv("PADDLE_TRAINERS_NUM"))
     args["endpoints"] = os.getenv('PADDLE_TRAINER_ENDPOINTS')
@@ -136,29 +114,46 @@ class TestDistBase(unittest.TestCase):
         worker_endpoints = self._ps_endpoints.split(",")
         w0_ep, w1_ep = worker_endpoints
         #print("w0_ep:",w0_ep," w1_ep:",w1_ep)
-        env0 = {
-            "FLAGS_selected_gpus": "0",
-            "PADDLE_TRAINER_ID": "0",
-            "PADDLE_TRAINERS_NUM": "2",
-            "PADDLE_TRAINER_ENDPOINTS": self._ps_endpoints,
-            "PADDLE_CURRENT_ENDPOINT": w0_ep
-        }
+        if core.is_compiled_with_cuda():
+            env0 = {
+                "FLAGS_selected_gpus": "0",
+                "PADDLE_TRAINER_ID": "0",
+                "PADDLE_TRAINERS_NUM": "2",
+                "PADDLE_TRAINER_ENDPOINTS": self._ps_endpoints,
+                "PADDLE_CURRENT_ENDPOINT": w0_ep
+            }
 
-        env1 = {
-            "FLAGS_selected_gpus": "1",
-            "PADDLE_TRAINER_ID": "1",
-            "PADDLE_TRAINERS_NUM": "2",
-            "PADDLE_TRAINER_ENDPOINTS": self._ps_endpoints,
-            "PADDLE_CURRENT_ENDPOINT": w1_ep
-        }
+            env1 = {
+                "FLAGS_selected_gpus": "1",
+                "PADDLE_TRAINER_ID": "1",
+                "PADDLE_TRAINERS_NUM": "2",
+                "PADDLE_TRAINER_ENDPOINTS": self._ps_endpoints,
+                "PADDLE_CURRENT_ENDPOINT": w1_ep
+            }
+        elif core.is_compiled_with_xpu():
+            env0 = {
+                "FLAGS_selected_xpus": "0",
+                "PADDLE_TRAINER_ID": "0",
+                "PADDLE_TRAINERS_NUM": "2",
+                "PADDLE_TRAINER_ENDPOINTS": self._ps_endpoints,
+                "PADDLE_CURRENT_ENDPOINT": w0_ep
+            }
+
+            env1 = {
+                "FLAGS_selected_xpus": "1",
+                "PADDLE_TRAINER_ID": "1",
+                "PADDLE_TRAINERS_NUM": "2",
+                "PADDLE_TRAINER_ENDPOINTS": self._ps_endpoints,
+                "PADDLE_CURRENT_ENDPOINT": w1_ep
+            }
         #update environment
         env0.update(envs)
         env1.update(envs)
         tr_cmd = "%s %s"
         tr0_cmd = tr_cmd % (self._python_interp, model_file)
         tr1_cmd = tr_cmd % (self._python_interp, model_file)
-        tr0_pipe = open("/tmp/tr0_err.log", "w")
-        tr1_pipe = open("/tmp/tr1_err.log", "w")
+        tr0_pipe = open("/tmp/tr0_err_%d.log" % os.getpid(), "w")
+        tr1_pipe = open("/tmp/tr1_err_%d.log" % os.getpid(), "w")
         #print(tr0_cmd) 
         tr0_proc = subprocess.Popen(
             tr0_cmd.strip().split(),
@@ -179,9 +174,9 @@ class TestDistBase(unittest.TestCase):
         # close trainer file
         tr0_pipe.close()
         tr1_pipe.close()
-        with open("/tmp/tr0_err.log", "r") as f:
+        with open("/tmp/tr0_err_%d.log" % os.getpid(), "r") as f:
             sys.stderr.write('trainer 0 stderr file: %s\n' % f.read())
-        with open("/tmp/tr1_err.log", "r") as f:
+        with open("/tmp/tr1_err_%d.log" % os.getpid(), "r") as f:
             sys.stderr.write('trainer 1 stderr file: %s\n' % f.read())
         return pickle.loads(tr0_out), pickle.loads(
             tr1_out), tr0_proc.pid, tr1_proc.pid
@@ -193,6 +188,10 @@ class TestDistBase(unittest.TestCase):
                          path_id="0",
                          check_error_log=False,
                          need_envs={}):
+        if backend == "nccl" or backend == "bkcl":
+            with_gloo = '0'
+        else:
+            with_gloo = '1'
         required_envs = {
             "FLAGS_fraction_of_gpu_memory_to_use": "0.15",
             "FLAGS_eager_delete_tensor_gb": "0.0",
@@ -202,6 +201,7 @@ class TestDistBase(unittest.TestCase):
             "LD_PRELOAD": os.getenv("LD_PRELOAD", ""),
             "GLOG_v": "0",
             "NCCL_P2P_DISABLE": "1",
+            "PADDLE_WITH_GLOO": with_gloo,
             "BACKEND": backend,
             "PATH_ID": path_id
         }
@@ -243,5 +243,31 @@ class TestDistBase(unittest.TestCase):
             self.assertTrue(
                 np.allclose(
                     tr1_out, need_result, rtol=1e-05, atol=1e-05))
+        elif col_type == "parallel_embedding":
+            result_data = tr0_out[0]
+            np.random.seed(2020)
+            need_result = np.random.rand(10, 8)
+            for i in range(result_data.shape[0]):
+                for j in range(result_data.shape[1]):
+                    data = result_data[i][j]
+                    if data >= 4: data += 1
+                    assert np.allclose(
+                        tr0_out[1][i][j], need_result[data], atol=1e-08)
+        elif col_type == "row_parallel_linear":
+            result_data = tr0_out[0]
+            np.random.seed(2020)
+            weight = np.random.rand(1000, 16)
+            need_result = np.matmul(input1, weight)
+            self.assertTrue(
+                np.allclose(
+                    result_data, need_result, rtol=1e-05, atol=1e-05))
+        elif col_type == "column_parallel_linear":
+            result_data = tr0_out[0]
+            np.random.seed(2020)
+            weight = np.random.rand(1000, 16)
+            need_result = np.matmul(input1, weight)
+            self.assertTrue(
+                np.allclose(
+                    result_data, need_result, rtol=1e-05, atol=1e-05))
         else:
             pass

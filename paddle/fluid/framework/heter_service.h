@@ -29,10 +29,13 @@ limitations under the License. */
 #include "brpc/channel.h"
 #include "brpc/controller.h"
 #include "brpc/server.h"
+#include "paddle/fluid/platform/timer.h"
+#endif
 
 namespace paddle {
 namespace framework {
 
+#ifdef PADDLE_WITH_PSLIB
 typedef std::function<int(const HeterRequest*, HeterResponse*)>
     HeterServiceHandler;
 class DataFeed;
@@ -100,6 +103,9 @@ class HeterTask {
     collect_label_time = 0;
     fill_sparse_time = 0;
     push_sparse_time = 0;
+    gpu_2_cpu_time = 0;
+    cpu_2_gpu_time = 0;
+    timeline.Reset();
   }
   void Show() {
     std::cout << "features size " << features_.size() << std::endl;
@@ -110,6 +116,8 @@ class HeterTask {
   }
   void PackTask(Scope* scope, int taskid, DataFeed* reader, int cur_batch,
                 const ProgramDesc& program);
+  void PackGpuTask(Scope* thread_scope, DataFeed* reader,
+                   const ProgramDesc& program);
 
   Scope* scope_{nullptr};
   int taskid_;
@@ -132,8 +140,11 @@ class HeterTask {
   double collect_label_time{0};
   double fill_sparse_time{0};
   double push_sparse_time{0};
+  double gpu_2_cpu_time{0};
+  double cpu_2_gpu_time{0};
+  platform::Timer timeline;
 };
-
+#endif
 template <class T>
 class HeterObjectPool {
  public:
@@ -143,8 +154,8 @@ class HeterObjectPool {
     std::lock_guard<std::mutex> lock(mutex_);
     if (pool_.empty()) {
       num_ += 1;
-#ifdef PADDLE_WITH_CUDA
-      VLOG(0) << "pool construct size: " << num_;
+#if defined(PADDLE_WITH_CUDA) || defined(PADDLE_WITH_HIP)
+      VLOG(3) << "pool construct size: " << num_;
 #endif
       return std::make_shared<T>();
     } else {
@@ -169,6 +180,7 @@ class HeterObjectPool {
   int num_{0};
 };
 
+#ifdef PADDLE_WITH_PSLIB
 struct BthreadMutextGuard {
   BthreadMutextGuard(bthread_mutex_t* rho) {
     mutex_ = rho;
@@ -249,7 +261,6 @@ class HeterList {
     std::unique_lock<std::mutex> lock(mutex_);
     cond_.wait(lock, [this] { return size < cap_; });
     if (task_map_.find(key) != task_map_.end()) {
-      // std::cout << "try put key=" << key << " false" << std::endl;
       task_map_.erase(key);
       return false;
     } else {
@@ -258,7 +269,6 @@ class HeterList {
       node->value = value;
       map_[node->key] = node;
       attach(node);
-      // std::cout << "try put key=" << key << " true" << std::endl;
       return true;
     }
   }
@@ -267,7 +277,6 @@ class HeterList {
     std::unique_lock<std::mutex> lock(mutex_);
     cond_.wait(lock, [this] { return size < cap_; });
     HeterNode<K, T>* node = new HeterNode<K, T>;
-    // std::cout << "put key=" << key << " true" << std::endl;
     node->key = key;
     node->value = value;
     map_[node->key] = node;
@@ -279,7 +288,6 @@ class HeterList {
     std::lock_guard<std::mutex> lock(mutex_);
     auto iter = map_.find(key);
     if (iter != map_.end()) {
-      // std::cout << "try get key=" << key << " true" << std::endl;
       HeterNode<K, T>* node = iter->second;
       detach(node);
       cond_.notify_one();
@@ -289,7 +297,6 @@ class HeterList {
       return ret;
     }
     task_map_.insert(key);
-    // std::cout << "try get key=" << key << " false" << std::endl;
     return nullptr;
   }
 
@@ -297,7 +304,6 @@ class HeterList {
     std::lock_guard<std::mutex> lock(mutex_);
     auto iter = map_.find(key);
     if (iter != map_.end()) {
-      // std::cout << "get key=" << key << " true" << std::endl;
       HeterNode<K, T>* node = iter->second;
       detach(node);
       cond_.notify_one();
@@ -306,7 +312,6 @@ class HeterList {
       delete node;
       return ret;
     }
-    // std::cout << "get key=" << key << " false" << std::endl;
     return nullptr;
   }
 
@@ -314,14 +319,12 @@ class HeterList {
     std::lock_guard<std::mutex> lock(mutex_);
     HeterNode<K, T>* node = head_->next;
     if (node == tail_) {
-      // std::cout << "get2 false" << std::endl;
       return nullptr;
     } else {
       detach(node);
       cond_.notify_one();
       T ret = std::move(node->value);
       map_.erase(node->key);
-      // std::cout << "get2 key=" << node->key << " true" << std::endl;
       delete node;
       return ret;
     }
@@ -362,7 +365,7 @@ class HeterList {
   int cap_;
   int size;
 };
+#endif
 
 }  // namespace framework
 }  // namespace paddle
-#endif

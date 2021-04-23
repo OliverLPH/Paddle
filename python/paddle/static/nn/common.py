@@ -26,7 +26,7 @@ def fc(x,
        bias_attr=None,
        activation=None,
        name=None):
-    """
+    r"""
 
     Fully-Connected layer can take a tensor or a list of tensor as its inputs.
     It creates a 2-D weight tensor for each input tensor, which represents its
@@ -106,6 +106,7 @@ def fc(x,
         weight_attr (ParamAttr, optional): The attribute for the learnable weight.
             The default value is None, and the weight will be initialized to zero.
             For detailed information, please refer to :attr:`paddle.ParamAttr`.
+            Warning, if x is a list of tensor, weight_attr should also be a list of same length.
         bias_attr (ParamAttr|bool, optional): The attribute of the learnable bias. 
             If it is set to False, no bias will be added to the output.
             If it is set to None or one kind of ParamAttr, a bias parameter will
@@ -180,7 +181,7 @@ def deform_conv2d(x,
                   weight_attr=None,
                   bias_attr=None,
                   name=None):
-    """
+    r"""
 
     Compute 2-D deformable convolution on 4-D input.
     Given input image x, output feature map y, the deformable convolution operation can be expressed as follow:

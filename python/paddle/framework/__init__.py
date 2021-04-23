@@ -12,35 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# TODO: import framework api under this directory 
+# TODO: import framework api under this directory
 __all__ = [
-    'create_parameter', 'ParamAttr',
-    'CPUPlace', 'CUDAPlace', 'CUDAPinnedPlace', 'get_default_dtype',
-    'set_default_dtype'
+    'create_parameter', 'ParamAttr', 'CPUPlace', 'CUDAPlace', 'CUDAPinnedPlace',
+    'NPUPlace', 'get_default_dtype', 'set_default_dtype'
 ]
 
 __all__ += [
-    'grad', 'LayerList', 'load', 'save', 'to_variable', 'no_grad',
+    'grad', 'set_grad_enabled', 'LayerList', 'load', 'save', 'no_grad',
     'DataParallel'
 ]
 
 from . import random
-from .random import manual_seed
+from .random import seed
 from .framework import get_default_dtype
 from .framework import set_default_dtype
+from .framework import set_grad_enabled
 
-from ..fluid.framework import ComplexVariable  #DEFINE_ALIAS
 from ..fluid.param_attr import ParamAttr  #DEFINE_ALIAS
 # from ..fluid.layers.tensor import create_global_var  #DEFINE_ALIAS
 from ..fluid.layers.tensor import create_parameter  #DEFINE_ALIAS
 from ..fluid.core import CPUPlace  #DEFINE_ALIAS
 from ..fluid.core import CUDAPlace  #DEFINE_ALIAS
 from ..fluid.core import CUDAPinnedPlace  #DEFINE_ALIAS
+from ..fluid.core import NPUPlace  #DEFINE_ALIAS
 from ..fluid.core import VarBase  #DEFINE_ALIAS
 
 from paddle.fluid import core  #DEFINE_ALIAS
-from ..fluid.dygraph.base import no_grad  #DEFINE_ALIAS
-from ..fluid.dygraph.base import to_variable  #DEFINE_ALIAS
+from ..fluid.dygraph.base import no_grad_ as no_grad  #DEFINE_ALIAS
 from ..fluid.dygraph.base import grad  #DEFINE_ALIAS
 from .io import save
 from .io import load

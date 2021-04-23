@@ -59,7 +59,7 @@ class LayerHelperBase(object):
         return cls.__dtype
 
     def to_variable(self, value, name=None):
-        """
+        r"""
         The API will create a ``Variable`` object from numpy\.ndarray or Variable object.
 
         Parameters:
@@ -331,12 +331,14 @@ class LayerHelperBase(object):
             if isinstance(dtype, core.VarDesc.VarType):
                 if dtype != core.VarDesc.VarType.FP32 and \
                         dtype != core.VarDesc.VarType.FP64 and \
-                        dtype != core.VarDesc.VarType.FP16:
+                        dtype != core.VarDesc.VarType.FP16 and \
+                        dtype != core.VarDesc.VarType.BF16:
                     raise TypeError(
                         "Can not create parameter with default initializer when dtype is not float type. Set default_initializer to fit the parameter dtype!"
                     )
             else:
-                if not (dtype.startswith("float") or dtype == "double"):
+                if not (dtype.startswith("float") or
+                        dtype in ["double", "uint16"]):
                     raise TypeError(
                         "Can not create parameter with default initializer when dtype is not float type. Set default_initializer to fit the parameter dtype!"
                     )

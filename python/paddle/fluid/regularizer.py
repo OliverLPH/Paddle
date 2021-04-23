@@ -28,10 +28,12 @@ def _create_regularization_of_grad(param, grad, regularization=None):
     Function helper of append_regularization_ops.
     """
     # If no gradient or no regularization is specified,  then we don't need to do anything
-    if grad is None or (param.regularizer is None and regularization is None):
+    if grad is None or ((not hasattr(param, 'regularizer') or (
+            hasattr(param, 'regularizer') and param.regularizer is None)) and
+                        regularization is None):
         return grad
     regularization_term = None
-    if param.regularizer is not None:
+    if hasattr(param, 'regularizer') and param.regularizer is not None:
         # Add variable for regularization term in grad block
         regularization_term = param.regularizer(param, grad, grad.block)
     elif regularization is not None:
@@ -63,7 +65,7 @@ def _create_regularization_of_grad(param, grad, regularization=None):
 
 
 def append_regularization_ops(parameters_and_grads, regularization=None):
-    """Create and add backward regularization Operators
+    r"""Create and add backward regularization Operators
 
     Creates and adds backward regularization operators in the BlockDesc.
     This will add gradients of the regularizer function to the gradients
@@ -132,7 +134,7 @@ class WeightDecayRegularizer(object):
 
 
 class L2DecayRegularizer(WeightDecayRegularizer):
-    """ 
+    r""" 
     Implement the L2 Weight Decay Regularization, which helps to prevent the model over-fitting.
 
     It can be set in :ref:`api_fluid_ParamAttr` or ``optimizer`` (such as :ref:`api_fluid_optimizer_SGDOptimizer` ). 
@@ -213,7 +215,7 @@ class L2DecayRegularizer(WeightDecayRegularizer):
         Returns:
             new variable for weight decay
         """
-        assert isinstance(param, framework.Parameter)
+        assert isinstance(param, framework.Variable)
         assert isinstance(block, framework.Block)
 
         inputs = {"X": [param]}
@@ -239,7 +241,7 @@ class L2DecayRegularizer(WeightDecayRegularizer):
 
 
 class L1DecayRegularizer(WeightDecayRegularizer):
-    """
+    r"""
     Implement the L1 Weight Decay Regularization, which encourages the weights to be sparse.
     
     It can be set in :ref:`api_fluid_ParamAttr` or ``optimizer`` (such as :ref:`api_fluid_optimizer_SGDOptimizer` ). 
@@ -320,7 +322,7 @@ class L1DecayRegularizer(WeightDecayRegularizer):
         Returns:
             new variable for weight decay
         """
-        assert isinstance(param, framework.Parameter)
+        assert isinstance(param, framework.Variable)
         assert isinstance(block, framework.Block)
 
         if framework.in_dygraph_mode():
