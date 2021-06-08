@@ -39,9 +39,7 @@ EXPRESSION_MAP = {
     "__rsub__": "A -= B",
     "__mul__": "A * B",
     "__rmul__": "A *= B",
-    "__div__": "A / B",
     "__truediv__": "A / B",
-    "__rdiv__": "A /= B",
     "__rtruediv__": "A /= B",
     "__pow__": "A ** B",
     "__rpow__": "A **= B",
@@ -209,9 +207,6 @@ def monkey_patch_variable():
     def _scalar_mul_(var, value):
         return _scalar_op_(var, value, 0.0)
 
-    def _scalar_div_(var, value):
-        return _scalar_op_(var, 1.0 / value, 0.0)
-
     def _binary_creator_(method_name,
                          op_type,
                          reverse=False,
@@ -241,7 +236,10 @@ def monkey_patch_variable():
                 if op_type == 'elementwise_div' and self.dtype in _supported_int_dtype_:
                     self = astype(self, 'float32')
                 # here use `scale` replace `elementwise` to get better performance
-                # but only +, -, *, / can use this method
+                # but only +, -, * can use this method
+                # NOTE(chentianyu03): / can not use `scale` method，because the result of
+                # `scale` method (self*(1/other_var)) do not exactly equal with the result 
+                # of `elementwise_div` method.
                 if scalar_method is not None:
                     return scalar_method(self, other_var)
             else:
@@ -337,12 +335,8 @@ def monkey_patch_variable():
         #  a*b == b*a. Do not need to reverse explicitly
         ('__rmul__',
          _binary_creator_('__rmul__', 'elementwise_mul', False, _scalar_mul_)),
-        ('__div__', _binary_creator_('__div__', 'elementwise_div', False,
-                                     _scalar_div_)),
         ('__truediv__', _binary_creator_('__truediv__', 'elementwise_div',
-                                         False, _scalar_div_)),
-        ('__rdiv__', _binary_creator_('__rdiv__', 'elementwise_div', True,
-                                      None)),
+                                         False, None)),
         ('__rtruediv__', _binary_creator_('__rtruediv__', 'elementwise_div',
                                           True, None)),
         ('__pow__', _binary_creator_('__pow__', 'elementwise_pow', False,
@@ -370,13 +364,7 @@ def monkey_patch_variable():
             setattr(Variable, method_name, method_impl)
     else:
         import paddle.tensor
-        variabel_methods = paddle.tensor.linalg.__all__ + \
-                           paddle.tensor.math.__all__ + \
-                           paddle.tensor.logic.__all__ + \
-                           paddle.tensor.manipulation.__all__ + \
-                           paddle.tensor.search.__all__ + \
-                           paddle.tensor.stat.__all__ + \
-                           paddle.tensor.attribute.__all__
+        variabel_methods = paddle.tensor.tensor_method_func
         for method_name in variabel_methods:
             if hasattr(Variable, method_name): continue
             method_impl = getattr(paddle.tensor, method_name, None)

@@ -312,6 +312,10 @@ class LayerHelperBase(object):
         if not attr:
             return None
         assert isinstance(attr, ParamAttr)
+        for i, size in enumerate(shape):
+            assert size > 0, (
+                "Expected every dim's size to be larger than 0, "
+                "but the size of the {}-th dim is {}".format(i, size))
         # set global dtype
         if not dtype:
             dtype = self.__dtype
@@ -381,7 +385,10 @@ class LayerHelperBase(object):
             return self.main_program.global_block().create_parameter(
                 dtype=dtype, shape=shape, type=type, **attr._to_kwargs())
 
-    def create_variable_for_type_inference(self, dtype, stop_gradient=False):
+    def create_variable_for_type_inference(self,
+                                           dtype,
+                                           stop_gradient=False,
+                                           shape=None):
         """Create a temporary variable that should be type inferred layer.
 
         Note:
@@ -397,6 +404,7 @@ class LayerHelperBase(object):
             name=unique_name.generate_with_ignorable_key(".".join(
                 [self.name, 'tmp'])),
             dtype=dtype,
+            shape=shape,
             type=core.VarDesc.VarType.LOD_TENSOR,
             persistable=False,
             stop_gradient=stop_gradient)

@@ -20,10 +20,14 @@ set(PADDLE_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
 
 include(system)
 
-project(paddle CXX C)
+# Note(zhouwei): Ninja Generator will set CMAKE_BUILD_TYPE to Debug
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING
+      "Choose the type of build, options are: Debug Release RelWithDebInfo MinSizeRel"
+      FORCE)
+endif()
 
-include(init)
-include(generic)            # simplify cmake module
+project(paddle CXX C)
 
 # enable language CUDA
 # TODO(Shibo Tao): remove find_package(CUDA) completely.
@@ -38,6 +42,10 @@ option(WITH_ROCM        "Compile PaddlePaddle with ROCM platform"       OFF)
 # to develop some acl related functionality on x86
 option(WITH_ASCEND_CL         "Compile PaddlePaddle with ASCEND CL"        ${WITH_ASCEND})
 option(WITH_ASCEND_CXX11         "Compile PaddlePaddle with ASCEND and CXX11 ABI"        OFF)
+# Note(zhouwei): It use option above, so put here
+include(init)
+include(generic)            # simplify cmake module
+
 if (WITH_GPU  AND WITH_XPU)
     message(FATAL_ERROR "Error when compile GPU and XPU at the same time")
 endif()
@@ -104,8 +112,8 @@ if(WIN32)
         endforeach(flag_var)
     endif()
 
-    # NOTE(Avin0323): Less parallel count result in faster compilation.
     math(EXPR PROCESS_MAX "${CPU_CORES} * 2 / 3")
+
     # windows build turn off warnings, use parallel compiling.
     foreach(flag_var
         CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE
@@ -113,7 +121,10 @@ if(WIN32)
         CMAKE_C_FLAGS CMAKE_C_FLAGS_DEBUG CMAKE_C_FLAGS_RELEASE
         CMAKE_C_FLAGS_MINSIZEREL CMAKE_C_FLAGS_RELWITHDEBINFO)
         string(REGEX REPLACE "/W[1-4]" " /W0 " ${flag_var} "${${flag_var}}")
-        set(${flag_var} "${${flag_var}} /MP${PROCESS_MAX}")
+        # NOTE(zhouwei25): GPU compile have too high memory utilization when parallel compiling
+        if(NOT WITH_GPU)
+            set(${flag_var} "${${flag_var}} /MP${PROCESS_MAX}")
+        endif()
     endforeach(flag_var)
     foreach(flag_var CMAKE_CXX_FLAGS CMAKE_C_FLAGS)
         set(${flag_var} "${${flag_var}} /w")
@@ -133,6 +144,9 @@ if(WIN32)
 
     foreach(flag_var CMAKE_SHARED_LINKER_FLAGS CMAKE_STATIC_LINKER_FLAGS CMAKE_EXE_LINKER_FLAGS CMAKE_LINKER_FLAGS)
         set(${flag_var} "${${flag_var}} /ignore:4049 /ignore:4217 /ignore:4006 /ignore:4221")
+        if(MSVC_STATIC_CRT)
+            set(${flag_var} "${${flag_var}} /NODEFAULTLIB:MSVCRT.LIB")
+        endif()
     endforeach(flag_var)
 
     if (WITH_WIN_DUMP_DBG)
@@ -206,12 +220,6 @@ if(NOT PY_VERSION)
 endif()
 set(PYBIND11_PYTHON_VERSION ${PY_VERSION})
 
-# CMAKE_BUILD_TYPE
-if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE "Release" CACHE STRING
-      "Choose the type of build, options are: Debug Release RelWithDebInfo MinSizeRel"
-      FORCE)
-endif()
 
 # the type of sanitizer, options are: Address, Leak, Memory, Thread, Undefined. Default: OFF
 if(SANITIZER_TYPE AND NOT "${SANITIZER_TYPE}" MATCHES "^(Address|Leak|Memory|Thread|Undefined)$")
@@ -276,6 +284,27 @@ if(WITH_GPU)
     endif()
 endif()
 
+if(WITH_ROCM)
+    include(hip)
+    include(miopen) # set miopen libraries, must before configure
+endif(WITH_ROCM)
+
+if (NOT WITH_ROCM AND WITH_RCCL)
+    MESSAGE(WARNING
+        "Disable RCCL when compiling without ROCM. Force WITH_RCCL=OFF.")
+    set(WITH_RCCL OFF CACHE STRING
+        "Disable RCCL when compiling without ROCM" FORCE)
+endif()
+
+if(WITH_RCCL)
+     add_definitions("-DPADDLE_WITH_RCCL")
+     include(rccl)
+else()
+     if(WITH_ROCM)
+         MESSAGE(WARNING "If the environment is multi-card, the WITH_RCCL option needs to be turned on, otherwise only a single card can be used.")
+     endif()
+endif()
+
 include(third_party)  # download, build, install third_party, Contains about 20+ dependencies
 
 include(flags)              # set paddle compile flags
@@ -299,26 +328,6 @@ include(coveralls)          # set code coverage
 include(configure)          # add paddle env configuration
 
 include_directories("${PADDLE_SOURCE_DIR}")
-
-if(WITH_ROCM)
-    include(hip)
-endif(WITH_ROCM)
-
-if (NOT WITH_ROCM AND WITH_RCCL)
-    MESSAGE(WARNING
-        "Disable RCCL when compiling without ROCM. Force WITH_RCCL=OFF.")
-    set(WITH_RCCL OFF CACHE STRING
-        "Disable RCCL when compiling without ROCM" FORCE)
-endif()
-
-if(WITH_RCCL)
-     add_definitions("-DPADDLE_WITH_RCCL")
-     include(rccl)
-else()
-     if(WITH_ROCM)
-         MESSAGE(WARNING "If the environment is multi-card, the WITH_RCCL option needs to be turned on, otherwise only a single card can be used.")
-     endif()
-endif()
 
 if(WITH_NV_JETSON)
     set(WITH_ARM ON CACHE STRING "Set WITH_ARM=ON when compiling WITH_NV_JETSON=ON." FORCE)
@@ -346,6 +355,11 @@ if (WITH_MIPS)
     add_definitions(-DPADDLE_WITH_MIPS)
 endif()
 
+if (WITH_HETERPS)
+    if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 7.0)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -faligned-new")
+    endif()
+endif()
 set(PADDLE_PYTHON_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/python/build")
 
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 -g -DNDEBUG")

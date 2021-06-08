@@ -19,7 +19,7 @@ from paddle.fluid.wrapped_decorator import wrap_decorator
 import google.protobuf.text_format
 import google.protobuf
 
-__all__ = ["DistributedStrategy"]
+__all__ = []
 
 non_auto_func_called = True
 
@@ -286,7 +286,7 @@ class DistributedStrategy(object):
             self.a_sync_configs = {"k_steps": 0}
         else:
             raise ValueError(
-                "The type of `flag` is invalid, expected type is bool, but received %s".
+                "The type of `flag` is invalid, expected type is bool, but received {}".
                 format(type(flag)))
 
     @property
@@ -626,7 +626,7 @@ class DistributedStrategy(object):
         Indicating whether we are using find_unused_parameters to 
         find unused parameters in DataParallel.
 
-        Default value: True
+        Default value: False
 
         Examples:
 
@@ -814,7 +814,7 @@ class DistributedStrategy(object):
                 "sharding_segment_strategy": "segment_broadcast_MB",
                 "segment_broadcast_MB": 32,
                 "sharding_degree": 8,
-                "sharding_degree": 2,
+                "dp_degree": 2,
                 "gradient_merge_acc_step": 4,
                 }
         """
@@ -826,6 +826,32 @@ class DistributedStrategy(object):
         check_configs_key(self.strategy.sharding_configs, configs,
                           "sharding_configs")
         assign_configs_value(self.strategy.sharding_configs, configs)
+
+    @property
+    def without_graph_optimization(self):
+        """
+        Run program using Executor other than ParallelExecutor.
+
+        Examples:
+
+          .. code-block:: python
+
+            import paddle.distributed.fleet as fleet
+            strategy = fleet.DistributedStrategy()
+            strategy.without_graph_optimization = True
+
+        """
+        return self.strategy.without_graph_optimization
+
+    @without_graph_optimization.setter
+    @is_strict_auto
+    def without_graph_optimization(self, flag):
+        if isinstance(flag, bool):
+            self.strategy.without_graph_optimization = flag
+        else:
+            print(
+                "WARNING: without_graph_optimization should have value of bool type"
+            )
 
     @property
     def pipeline(self):
@@ -890,6 +916,61 @@ class DistributedStrategy(object):
         check_configs_key(self.strategy.pipeline_configs, configs,
                           "pipeline_configs")
         assign_configs_value(self.strategy.pipeline_configs, configs)
+
+    @property
+    def tensor_parallel(self):
+        """
+        Indicating whether we are using tensor parallel for distributed training.
+
+        Examples:
+
+          .. code-block:: python
+
+            import paddle.distributed.fleet as fleet
+            strategy = fleet.DistributedStrategy()
+            strategy.tensor_parallel = True
+
+        """
+        return self.strategy.tensor_parallel
+
+    @tensor_parallel.setter
+    @is_strict_auto
+    def tensor_parallel(self, flag):
+        if isinstance(flag, bool):
+            self.strategy.tensor_parallel = flag
+        else:
+            print("WARNING: tensor_parallel should have value of bool type")
+
+    @property
+    def tensor_parallel_configs(self):
+        """
+        Set tensor_parallel configurations.
+
+        **Notes**:
+            **Detailed arguments for tensor_parallel_configs**
+            **tensor_parallel_degree**: degree of tensor parallel
+            **tensor_init_seed**: parameter initialization random seed
+
+
+        Examples:
+
+          .. code-block:: python
+
+            import paddle.distributed.fleet as fleet
+            strategy = fleet.DistributedStrategy()
+            strategy.tensor_parallel = True
+            strategy.tensor_parallel_configs = {"tensor_parallel_degree": 4,
+                                                "tensor_init_seed": 123}
+
+        """
+        return get_msg_dict(self.strategy.tensor_parallel_configs)
+
+    @tensor_parallel_configs.setter
+    @is_strict_auto
+    def tensor_parallel_configs(self, configs):
+        check_configs_key(self.strategy.tensor_parallel_configs, configs,
+                          "tensor_parallel_configs")
+        assign_configs_value(self.strategy.tensor_parallel_configs, configs)
 
     @property
     def hybrid_configs(self):

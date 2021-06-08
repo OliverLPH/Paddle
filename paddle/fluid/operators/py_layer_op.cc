@@ -60,33 +60,75 @@ void RunPyObject(py::object *py_object,
           outs->size(), result_tuple.size()));
     }
     for (size_t i = 0; i < result_tuple.size(); i++) {
-      if (Py_None != result_tuple[i].ptr()) {
-        try {
-          auto result_var =
-              result_tuple[i].cast<std::shared_ptr<imperative::VarBase>>();
-          *(*outs)[i] = result_var->Var();
-        } catch (py::cast_error &) {
-          PADDLE_THROW(platform::errors::Unimplemented(
-              "The output of `PyLayer.backward` should be `Tensor`."));
+      if ((*outs)[i] != nullptr) {
+        if (Py_None != result_tuple[i].ptr()) {
+          if (py::isinstance<imperative::VarBase>(result_tuple[i])) {
+            try {
+              auto result_var =
+                  result_tuple[i].cast<std::shared_ptr<imperative::VarBase>>();
+              *(*outs)[i] = result_var->Var();
+            } catch (py::cast_error &) {
+              PADDLE_THROW(platform::errors::InvalidArgument(
+                  "The `PyLayer.backward` function returns invalid argument, "
+                  "the `%s` type argument can not be cast into `Tensor`.",
+                  result_tuple[i].ptr()->ob_type->tp_name));
+            }
+          } else {
+            PADDLE_THROW(platform::errors::InvalidArgument(
+                "The output of `PyLayer.backward` should be `Tensor`, but "
+                "received `%s`.",
+                result_tuple[i].ptr()->ob_type->tp_name));
+          }
+        } else {
+          PADDLE_THROW(platform::errors::InvalidArgument(
+              "The %dth input tensor of forward needs gradient and the "
+              "corresponding gradient cannot be None.",
+              i));
         }
       } else {
-        PADDLE_THROW(platform::errors::Unimplemented(
-            "The output of `PyLayer.backward` can not be `None`."));
+        if (Py_None != result_tuple[i].ptr()) {
+          PADDLE_THROW(platform::errors::InvalidArgument(
+              "The %dth input tensor of forward do not need gradient and the "
+              "corresponding gradient should be `None`.",
+              i));
+        }
       }
     }
   } else {
-    if (Py_None != py_result.ptr()) {
-      try {
-        auto result_var =
-            py_result.cast<std::shared_ptr<imperative::VarBase>>();
-        *((*outs)[0]) = result_var->Var();
-      } catch (py::cast_error &) {
-        PADDLE_THROW(platform::errors::Unimplemented(
-            "The output of `PyLayer.backward` should be `Tensor`."));
+    if (1 != outs->size()) {
+      PADDLE_THROW(platform::errors::InvalidArgument(
+          "The number of outputs of `PyLayer.backward` should be %d, but "
+          "received 1.",
+          outs->size()));
+    }
+    if ((*outs)[0] != nullptr) {
+      if (Py_None != py_result.ptr()) {
+        if (py::isinstance<imperative::VarBase>(py_result)) {
+          try {
+            auto result_var =
+                py_result.cast<std::shared_ptr<imperative::VarBase>>();
+            *((*outs)[0]) = result_var->Var();
+          } catch (py::cast_error &) {
+            PADDLE_THROW(platform::errors::InvalidArgument(
+                "The `PyLayer.backward` function returns invalid argument, the "
+                "`%s` type argument can not be cast into `Tensor`.",
+                py_result.ptr()->ob_type->tp_name));
+          }
+        } else {
+          PADDLE_THROW(platform::errors::InvalidArgument(
+              "The output of `PyLayer.backward` should be `Tensor`, but "
+              "received `%s`",
+              py_result.ptr()->ob_type->tp_name));
+        }
+      } else {
+        PADDLE_THROW(platform::errors::InvalidArgument(
+            "The input tensor of forward needs gradient, so the output of "
+            "`PyLayer.backward` can not be `None`."));
       }
     } else {
-      PADDLE_THROW(platform::errors::Unimplemented(
-          "The output of `PyLayer.backward` can not be `None`."));
+      PADDLE_THROW(platform::errors::InvalidArgument(
+          "The input tensor of forward do not need gradient, so the output of "
+          "`PyLayer.backward` should be `None`."));
     }
   }
 }
@@ -133,9 +175,12 @@ class PyLayerOpKernel : public framework::OpKernel<T> {
  public:
   void Compute(const framework::ExecutionContext &ctx) const override {
     auto &op_ = ctx.GetOp();
-    auto pylayer_op = dynamic_cast<const PyLayerOp *>(&op_);
-    if (pylayer_op) {
-      auto py_layer_context = pylayer_op->GetPyLayerContext();
+    auto const_pylayer_op = dynamic_cast<const PyLayerOp *>(&op_);
+    if (const_pylayer_op) {
+      auto pylayer_op = const_cast<PyLayerOp *>(const_pylayer_op);
+
+      // Release contex after executing the compute
+      auto py_layer_context = pylayer_op->ReleasePyLayerContext();
       py::object bk_ctx(py::handle(py_layer_context->GetMutableCtx()), true);
       auto &input_vars = ctx.MultiInputVar("X");
       auto output_vars = ctx.MultiOutputVar("Out");
@@ -172,9 +217,9 @@ REGISTER_OP_CPU_KERNEL(
     ops::PyLayerOpKernel<paddle::platform::CPUDeviceContext, int16_t>,
     ops::PyLayerOpKernel<paddle::platform::CPUDeviceContext, int8_t>,
     ops::PyLayerOpKernel<paddle::platform::CPUDeviceContext,
-                         ::paddle::platform::complex64>,
+                         ::paddle::platform::complex<float>>,
     ops::PyLayerOpKernel<paddle::platform::CPUDeviceContext,
-                         ::paddle::platform::complex128>);
+                         ::paddle::platform::complex<double>>);
 #ifdef PADDLE_WITH_CUDA
 REGISTER_OP_CUDA_KERNEL(
     py_layer, ops::PyLayerOpKernel<paddle::platform::CUDADeviceContext, float>,
@@ -191,7 +236,7 @@ REGISTER_OP_CUDA_KERNEL(
     ops::PyLayerOpKernel<paddle::platform::CUDADeviceContext, int16_t>,
     ops::PyLayerOpKernel<paddle::platform::CUDADeviceContext, int8_t>,
     ops::PyLayerOpKernel<paddle::platform::CUDADeviceContext,
-                         ::paddle::platform::complex64>,
+                         ::paddle::platform::complex<float>>,
     ops::PyLayerOpKernel<paddle::platform::CUDADeviceContext,
-                         ::paddle::platform::complex128>);
+                         ::paddle::platform::complex<double>>);
 #endif  // PADDLE_WITH_CUDA
